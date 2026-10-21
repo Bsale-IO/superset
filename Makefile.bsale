@@ -7,6 +7,7 @@
 #   ecr-login                    Login docker to ECR (one-time per session)
 #   build-and-push-staging       Build + push :feat-{branch}-{sha}
 #   build-and-push-prod          Build + push :6.0.0 + :6.0.0-{sha}
+#   prune-staging                Delete older :feat-{branch}-{sha} tags of this branch
 #   print-vars                   Show resolved variables
 
 REGISTRY    ?= 239630721544.dkr.ecr.us-east-1.amazonaws.com
@@ -25,7 +26,14 @@ IMAGE       := $(REGISTRY)/$(REPO)
 # without manually editing source. Override if the repos live elsewhere.
 TFVARS_PATH ?= ../bsale-bi-staging/terraform/staging.auto.tfvars
 
-.PHONY: help ecr-login build-and-push-staging build-and-push-prod print-vars
+# Tag staging runs right now, read before build-and-push-staging overwrites the
+# tfvars. prune-staging never deletes it, so a staging rollback target survives.
+PREV_STAGING_TAG ?= $(shell sed -n 's/^frontend_assets_tag = "\(.*\)"/\1/p' $(TFVARS_PATH) 2>/dev/null)
+
+# DRY_RUN=1 make -f Makefile.bsale prune-staging  -> only print what would go.
+DRY_RUN ?=
+
+.PHONY: help ecr-login build-and-push-staging build-and-push-prod prune-staging print-vars
 
 help:
 	@echo "Bsale Makefile (use: make -f Makefile.bsale <target>)"
@@ -34,6 +42,7 @@ help:
 	@echo "  ecr-login                    Login docker to ECR ($(REGISTRY))"
 	@echo "  build-and-push-staging       Build + push :feat-$(GIT_BRANCH)-$(GIT_SHA) and write $(TFVARS_PATH)"
 	@echo "  build-and-push-prod          Build + push :6.0.0 + :6.0.0-$(GIT_SHA)"
+	@echo "  prune-staging                Delete older :feat-$(GIT_BRANCH)-* tags (DRY_RUN=1 to preview)"
 	@echo "  print-vars                   Show resolved variables"
 
 print-vars:
@@ -46,6 +55,7 @@ print-vars:
 	@echo "TAG         = $(TAG)"
 	@echo "IMAGE       = $(IMAGE)"
 	@echo "TFVARS_PATH = $(TFVARS_PATH)"
+	@echo "PREV_STAGING_TAG = $(PREV_STAGING_TAG)"
 
 ecr-login:
 	@aws ecr get-login-password --region $(AWS_REGION) | \
@@ -62,6 +72,29 @@ build-and-push-staging: ecr-login
 	@echo "Wrote:  $(TFVARS_PATH)"
 	@echo ""
 	@echo "Next:   cd $(dir $(TFVARS_PATH)) && terraform apply"
+	@$(MAKE) --no-print-directory -f $(firstword $(MAKEFILE_LIST)) prune-staging \
+	  PREV_STAGING_TAG="$(PREV_STAGING_TAG)" \
+	  || echo "WARNING: prune-staging failed; older feat-$(GIT_BRANCH)-* tags were kept."
+
+# One image per patch: the ECR lifecycle policy keeps only the 10 newest tagged
+# images of ANY tag, so every staging iteration would push a 6.0.0-* release out.
+# Deletes this branch's older iterations only: exact `feat-<branch>-<hex sha>`
+# match (a branch named `treemap` never touches `feat-treemap-remove-...`), and
+# never the tag just pushed nor the one staging currently runs. Release tags
+# (6.0.0*) are never matched.
+prune-staging:
+	@current="feat-$(GIT_BRANCH)-$(GIT_SHA)"; \
+	tags=$$(aws ecr list-images --region $(AWS_REGION) --repository-name $(REPO) \
+	  --filter tagStatus=TAGGED --query 'imageIds[].imageTag' --output text | tr '\t' '\n' \
+	  | grep -E '^feat-$(GIT_BRANCH)-[0-9a-f]+$$' \
+	  | grep -vxF "$$current" | grep -vxF "$(PREV_STAGING_TAG)"); \
+	if [ -z "$$tags" ]; then echo "prune-staging: nothing to delete for feat-$(GIT_BRANCH)-*"; exit 0; fi; \
+	for t in $$tags; do \
+	  if [ -n "$(DRY_RUN)" ]; then echo "prune-staging: would delete $$t"; \
+	  else aws ecr batch-delete-image --region $(AWS_REGION) --repository-name $(REPO) \
+	    --image-ids imageTag=$$t --query 'failures' --output text >/dev/null \
+	    && echo "prune-staging: deleted $$t"; fi; \
+	done
 
 build-and-push-prod: ecr-login
 	docker buildx build --platform $(PLATFORM) --push \
